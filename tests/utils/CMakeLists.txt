@@ -66,3 +66,8 @@ ecbuild_add_test( TARGET      eckit_test_rsync
                   CONDITION   HAVE_RSYNC
                   SOURCES     test_rsync.cc
                   LIBS        eckit rsync )
+
+ecbuild_add_test( TARGET      eckit_test_utils_binary_utils
+                  SOURCES     test_binary_utils.cc
+                  PROPERTIES  CXX_STANDARD 17
+                  LIBS        eckit  )

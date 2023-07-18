@@ -93,6 +93,7 @@ container/CacheLRU.cc
 container/CacheLRU.h
 container/CacheManager.cc
 container/CacheManager.h
+container/CircularQueue.h
 container/ClassExtent.h
 container/DenseMap.h
 container/DenseSet.h
@@ -675,7 +676,9 @@ persist/Isa.h
 )
 
 list( APPEND eckit_utils_srcs
+  utils/BinaryUtils.h
   utils/ByteSwap.h
+  utils/CompilerAbstractions.h
   utils/Compressor.cc
   utils/Compressor.h
   utils/Hash.cc
@@ -761,6 +764,7 @@ endif()
 
 
 list( APPEND eckit_memory_srcs
+memory/AlignedAllocator.h
 memory/Builder.cc
 memory/Builder.h
 memory/Counted.cc
