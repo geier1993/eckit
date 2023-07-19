@@ -38,7 +38,6 @@ ecbuild_add_test( TARGET   eckit_test_container_benchmark_densemap
                   SOURCES  benchmark_densemap.cc
                   LIBS     eckit )
 
-ecbuild_add_test( TARGET   eckit_test_circularqueue
-                  SOURCES  test_circularqueue.cc
-                  PROPERTIES CXX_STANDARD 17
+ecbuild_add_test( TARGET   eckit_test_container_lowlatencyqueue
+                  SOURCES  test_lowlatencyqueue.cc
                   LIBS     eckit )

@@ -93,7 +93,7 @@ container/CacheLRU.cc
 container/CacheLRU.h
 container/CacheManager.cc
 container/CacheManager.h
-container/CircularQueue.h
+container/LowLatencyQueue.h
 container/ClassExtent.h
 container/DenseMap.h
 container/DenseSet.h
