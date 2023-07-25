@@ -33,6 +33,8 @@
 #include <condition_variable>
 #include <mutex>
 
+#include <exception>
+
 namespace eckit {
 
 namespace lowlatency {
@@ -81,8 +83,8 @@ namespace lowlatency {
 // For super low-latency demands use a buily-wait spin without rescheduling
 template <bool RescheduleThreadOnOversubscription = false>
 struct SpinThread {
-    // @param outOfPeriod   Indicates that the queue is massively oversubscribed by a multiple of the queues capacity
-    constexpr void operator()(bool outOfPeriod) const noexcept {
+    // @param overSubscribed   Indicates that the queue is massively oversubscribed by a multiple of the queues capacity
+    constexpr void operator()(bool overSubscribed) const noexcept {
         // For sufficient large buffers and enough work, this should perform very well because.
         // If there's enough work, you'll notice the yield in performance,
         // hence best is to find appropriate buffersizes such that oversubscription is not happening...
@@ -90,7 +92,7 @@ struct SpinThread {
         // it's possible that a single thread performs 32 operations before another thread takes over.
         // If there are long periods of no work, the user has to identify these and
         // write a custom spinner to do something more reasonable when this happnes.
-        if (RescheduleThreadOnOversubscription && outOfPeriod) {
+        if (RescheduleThreadOnOversubscription && overSubscribed) {
             std::this_thread::yield();
         }
     }
@@ -110,8 +112,8 @@ struct SpinTimeThread {
     // If you wish to yield after some time... (measuring time also has its impact, but is not as expensive as rescheduling the thread)
     // If you know your application well and really know that there are cases when to sleep some threads... you have to define you own spin
     // TODO think about allowing introducing a conditional variable. Then more hooks are required to react on ticket changes...
-    void operator()(bool outOfPeriod) const noexcept {
-        if (RescheduleThreadOnOversubscription && outOfPeriod)
+    void operator()(bool overSubscribed) const noexcept {
+        if (RescheduleThreadOnOversubscription && overSubscribed)
             std::this_thread::yield();
         auto spinTime = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::microseconds>(spinTime - startSpin).count() > MaxSpinMusBeforeYield) {
@@ -164,9 +166,9 @@ struct ConditionedPushPopSpinFunctor {
 
     constexpr decltype(auto) spinOnPush() noexcept {
         std::chrono::time_point<std::chrono::steady_clock> startSpin = std::chrono::steady_clock::now();
-        return [startSpin, this](bool outOfPeriod) {
+        return [startSpin, this](bool overSubscribed) {
             auto spinTime = std::chrono::steady_clock::now();
-            if (outOfPeriod || (std::chrono::duration_cast<std::chrono::microseconds>(spinTime - startSpin).count() > MaxSpinMusBeforeWait)) {
+            if (overSubscribed || (std::chrono::duration_cast<std::chrono::microseconds>(spinTime - startSpin).count() > MaxSpinMusBeforeWait)) {
                 // Lock and wait
                 std::unique_lock<std::mutex> lock(this->mPush_);
                 this->cvPush_.wait_for(lock, std::chrono::microseconds(MaxWaitMus));
@@ -177,9 +179,9 @@ struct ConditionedPushPopSpinFunctor {
 
     constexpr decltype(auto) spinOnPop() noexcept {
         std::chrono::time_point<std::chrono::steady_clock> startSpin = std::chrono::steady_clock::now();
-        return [startSpin, this](bool outOfPeriod) {
+        return [startSpin, this](bool overSubscribed) {
             auto spinTime = std::chrono::steady_clock::now();
-            if (outOfPeriod || (std::chrono::duration_cast<std::chrono::microseconds>(spinTime - startSpin).count() > MaxSpinMusBeforeWait)) {
+            if (overSubscribed || (std::chrono::duration_cast<std::chrono::microseconds>(spinTime - startSpin).count() > MaxSpinMusBeforeWait)) {
                 // Lock and wait
                 std::unique_lock<std::mutex> lock(this->mPop_);
                 this->cvPop_.wait_for(lock, std::chrono::microseconds(MaxWaitMus));
@@ -187,6 +189,15 @@ struct ConditionedPushPopSpinFunctor {
             }
         };
     }
+};
+
+
+enum class QueueResult : int
+{
+    Aborted         = -1,
+    Success         = 0,
+    Closed          = 1,
+    SpuriousFailure = 2,
 };
 
 
@@ -351,7 +362,7 @@ struct EntryPack {
         //   and performed the last deqeue operation. The next pop by chance just wants to access the same index again...
         //   I could not figure out how the it lead directly to this constellation... but it happened even more often for smaller buffers.
         //
-        //   For long production runs where threads spin on queues until they get aborted externally... that doesn't matter. However
+        //   For long production runs where threads spin on queues until they get aborted or closed externally... that doesn't matter. However
         //   In a nitty-gritty test where we expect to perform exactly N push & pop, this is an important constraint.
         opt_value_type value{None{}};
 
@@ -642,7 +653,6 @@ struct EntryContainer<T, std::integral_constant<IntType, N>, INDT> {
     }
 };
 
-
 /* Multiple-producer-multiple-consumer circular buffer based on atomic synchronization.
  *
  * As system calls and memory allocation is avoided, the buffer is expected to show low latency.
@@ -722,7 +732,10 @@ private:
     ALIGN_CACHELINE std::atomic<INDT> head_;
     ALIGN_CACHELINE std::atomic<INDT> tail_;
     ALIGN_CACHELINE std::atomic<bool> abort_;
+    std::exception_ptr abortReason_;
+    ALIGN_CACHELINE std::atomic<bool> close_;
     static_assert(std::atomic<INDT>::is_always_lock_free, "Integer type for head & tail indices must be always lock free");
+    static_assert(std::atomic<bool>::is_always_lock_free, "Bool atomic must be always lock free");
 
     ContainerType container_;
 
@@ -792,6 +805,7 @@ public:
         head_.exchange(other.head_);
         tail_.exchange(other.tail_);
         abort_.exchange(other.abort_);
+        close_.exchange(other.close_);
         container_  = std::move(other.container_);
         PERIOD      = other.PERIOD;
         HALF_PERIOD = other.HALF_PERIOD;
@@ -803,6 +817,7 @@ public:
         head_.exchange(other.head_);
         tail_.exchange(other.tail_);
         abort_.exchange(other.abort_);
+        close_.exchange(other.close_);
         container_  = std::move(other.container_);
         PERIOD      = other.PERIOD;
         HALF_PERIOD = other.HALF_PERIOD;
@@ -814,6 +829,7 @@ public:
         head_{0},
         tail_{0},
         abort_{false},
+        close_{false},
         container_{std::forward<ContainerArgs>(containerArgs)...},
         PERIOD(computeResetPeriod(container_.size())),
         HALF_PERIOD(PERIOD / 2) {
@@ -829,8 +845,14 @@ public:
      *
      * TODO: Think about creating sanitizing feature that resets all tickets and allow reusing the queue
      */
+    void abort(std::exception_ptr reason) noexcept {
+        if (!abort_.load(std::memory_order_relaxed)) {
+            abortReason_ = reason;
+            abort_.store(true, std::memory_order_release);
+        }
+    }
     void abort() noexcept {
-        abort_.store(false);
+        abort(std::make_exception_ptr(std::runtime_error("Queue has been aborted without an exception.")));
     }
 
     bool hasBeenAborted() const noexcept {
@@ -838,9 +860,33 @@ public:
     }
 
 
+    void throwIfAborted() const {
+        if (abort_.load(std::memory_order_acquire)) {
+            if (abortReason_) {
+                std::rethrow_exception(abortReason_);
+            }
+            else {
+                throw std::runtime_error("Queue has been aborted without an exception.");
+            }
+        }
+    }
+
+    /* Closes the whole queue - allows producers to finish and allows consumers to pop until the queue is empty.
+     *
+     * TODO: Think about creating sanitizing feature that resets all tickets and allow reusing the queue
+     */
+    void close() noexcept {
+        close_.store(true);
+    }
+
+    bool isClosed() const noexcept {
+        return close_.load(std::memory_order_relaxed);
+    }
+
+
 private:
     template <typename SpinFunctor, typename... ElemOrArgs>
-    bool pushIndex(INDT ticket, SpinFunctor&& spin, ElemOrArgs&&... elemOrArgs) noexcept(
+    QueueResult pushIndex(INDT ticket, SpinFunctor&& spin, ElemOrArgs&&... elemOrArgs) noexcept(
         noexcept(T(std::forward<ElemOrArgs>(elemOrArgs)...)) && noexcept(spin(false))) {
         const INDT ind = modLikely(ticket, (INDT)container_.size());
         return container_.visit(ind,
@@ -853,14 +899,14 @@ private:
                                     while
                                         UNLIKELY((currentTicket = entry.ticket.load(std::memory_order_acquire)) != ticket) {
                                             if (abort_.load(std::memory_order_relaxed)) {
-                                                return false;
+                                                return QueueResult::Aborted;
                                             }
                                             // The current ticket is not our ticket - so it must be a previous ticket.
                                             // If its not used, we know that a previous push is still pending...
-                                            const bool outOfPeriod = !isTicketUsed(currentTicket);
+                                            const bool overSubscribed = !isTicketUsed(currentTicket);
 
                                             // Put some flag inside to customize spin, i.e. yield in this case
-                                            spin(outOfPeriod);
+                                            spin(overSubscribed);
                                         };
 
                                     // Now we are save to set the value... no need to CAS
@@ -868,12 +914,12 @@ private:
 
                                     // Finally set the next ticket
                                     entry.ticket.store(setTicketUsed(ticket), std::memory_order_release);
-                                    return true;
+                                    return QueueResult::Success;
                                 });
     }
 
     template <typename MoveElemFunctor, typename SpinFunctor>
-    bool popIndex(INDT ticket, MoveElemFunctor&& moveElem, SpinFunctor&& spin) noexcept(
+    QueueResult popIndex(INDT ticket, MoveElemFunctor&& moveElem, SpinFunctor&& spin) noexcept(
         noexcept(std::forward<MoveElemFunctor>(moveElem)(std::move(std::declval<T>()))) && noexcept(spin(false))) {
         const INDT ind = modLikely(ticket, (INDT)container_.size());
         return container_.visit(ind,
@@ -884,12 +930,16 @@ private:
                                     while
                                         UNLIKELY((currentTicket = entry.ticket.load(std::memory_order_acquire)) != usedTicket) {
                                             if (abort_.load(std::memory_order_relaxed)) {
-                                                return false;
+                                                return QueueResult::Aborted;
+                                            }
+                                            if (close_.load(std::memory_order_relaxed) && (computeSize(head_.load(std::memory_order_relaxed), ticket) <= 0)) {
+                                                return QueueResult::Closed;
                                             }
 
+
                                             // The currentTicket is not equal to our ticket, so a previous push or pop is still going on
-                                            const bool outOfPeriod = (setTicketUnused(currentTicket) != ticket);
-                                            spin(outOfPeriod);
+                                            const bool overSubscribed = (setTicketUnused(currentTicket) != ticket);
+                                            spin(overSubscribed);
                                         };
 
                                     // Now we are save to read the value
@@ -898,7 +948,7 @@ private:
 
                                     // Now increment ticket for next push/pop
                                     entry.ticket.store(nextUnusedTicket(ticket, container_.size()), std::memory_order_release);
-                                    return true;
+                                    return QueueResult::Success;
                                 });
     }
 
@@ -1000,7 +1050,8 @@ private:
         // Try to set increment tail...
         // If many other consumers are dequeuing optimistically, this is likely to fail
         do {
-            if (computeSize(head_.load(std::memory_order_relaxed), t) >= container_.size) {
+            auto size = computeSize(head_.load(std::memory_order_relaxed), t);
+            if ((size >= container_.size) || (close_.load(std::memory_order_relaxed) && size <= 0)) {
                 return std::optional<INDT>{};
             }
         } while (!tail_.compare_exchange_weak(t, modPeriod(t + 1), std::memory_order_relaxed));
@@ -1055,17 +1106,20 @@ public:
      * @param spin         Function that is called everytime the thread has to spin and wait for an state change of an entry.
      * @param elemOrArgs   Forwards all arguments to the constructor of the element type T.
      *                     (May perform a copy or move construction or just emplaces a value).
-     * @return             True if successful, false if the queue has been aborted
+     * @return             QueueResult (self-describing). For optimistic approaches  QueueResult::SpuriousFailure is not expected.
      */
     template <typename SpinFunctor, typename... ElemOrArgs>
-    bool pushWithSpinFunctor(SpinFunctor&& spin, ElemOrArgs&&... elemOrArgs) noexcept(
+    QueueResult pushWithSpinFunctor(SpinFunctor&& spin, ElemOrArgs&&... elemOrArgs) noexcept(
         noexcept(T(std::forward<ElemOrArgs>(elemOrArgs)...)) && noexcept(spin(false))) {
         // Optimistic: get next head atomically... then spin on state
         // Note: By using memory_order_seq_cst a a real FIFO order could be achieved.
         // However in cases where more threads than size of buffer are accessing the container, the contention in the state handling can not guarantee FIFO anyway...
         // Moreover it's hard to define "FIFO" for a concurrent programm
-        bool ret = pushIndex(nextHeadOpt(), std::forward<SpinFunctor>(spin), std::forward<ElemOrArgs>(elemOrArgs)...);
-        if (ret) {
+        if (close_.load(std::memory_order_relaxed)) {
+            return QueueResult::Closed;
+        }
+        QueueResult ret = pushIndex(nextHeadOpt(), std::forward<SpinFunctor>(spin), std::forward<ElemOrArgs>(elemOrArgs)...);
+        if (ret == QueueResult::Success) {
             pushPopSpin_.elementPushed();
         }
         return ret;
@@ -1076,11 +1130,28 @@ public:
      *
      * @param elemOrArgs   Forwards all arguments to the constructor of the element type T.
      *                     (May perform a copy or move construction or just emplaces a value).
-     * @return             True if successful, false if the queue has been aborted
+     * @return             QueueResult (self-describing). For optimistic approaches  QueueResult::SpuriousFailure is not expected.
      */
     template <typename... ElemOrArgs>
-    bool push(ElemOrArgs&&... elemOrArgs) noexcept(noexcept(pushWithSpinFunctor(pushPopSpin_.spinOnPush(), std::forward<ElemOrArgs>(elemOrArgs)...))) {
+    QueueResult push(ElemOrArgs&&... elemOrArgs) noexcept(noexcept(pushWithSpinFunctor(pushPopSpin_.spinOnPush(), std::forward<ElemOrArgs>(elemOrArgs)...))) {
         return pushWithSpinFunctor(pushPopSpin_.spinOnPush(), std::forward<ElemOrArgs>(elemOrArgs)...);
+    }
+
+    /* Calls `pushWithSpinFunctor` with the default spin functor specified through template argument of the LowLatencyQueue.
+     * Default is a busy-wait.
+     * Throws if the queue has been aborted.
+     *
+     * @param elemOrArgs   Forwards all arguments to the constructor of the element type T.
+     *                     (May perform a copy or move construction or just emplaces a value).
+     * @return             QueueResult (self-describing). For optimistic approaches  QueueResult::SpuriousFailure is not expected.
+     */
+    template <typename... ElemOrArgs>
+    QueueResult pushOrThrow(ElemOrArgs&&... elemOrArgs) {
+        QueueResult ret = push(std::forward<ElemOrArgs>(elemOrArgs)...);
+        if (ret == QueueResult::Aborted) {
+            throwIfAborted();
+        }
+        return ret;
     }
 
     /**
@@ -1097,13 +1168,13 @@ public:
      * @param moveElem  Functor that gets called with an rvalue of the element to be poped. The user can decide what to do.
      * @param spin      Function that is called everytime the thread has to spin and wait for an state change of an entry.
      * @return          Returns the poped value
-     * @return          True if successful, false if the queue has been aborted
+     * @return          QueueResult (self-describing). For optimistic approaches  QueueResult::SpuriousFailure is not expected.
      */
     template <typename MoveElemFunctor, typename SpinFunctor>
-    bool popWithSpinFunctor(MoveElemFunctor&& moveElem, SpinFunctor&& spin) noexcept(
+    QueueResult popWithSpinFunctor(MoveElemFunctor&& moveElem, SpinFunctor&& spin) noexcept(
         noexcept(std::forward<MoveElemFunctor>(moveElem)(std::move(std::declval<T>()))) && noexcept(spin(false))) {
-        bool ret = popIndex(nextTailOpt(), std::forward<MoveElemFunctor>(moveElem), std::forward<SpinFunctor>(spin));
-        if (ret) {
+        QueueResult ret = popIndex(nextTailOpt(), std::forward<MoveElemFunctor>(moveElem), std::forward<SpinFunctor>(spin));
+        if (ret == QueueResult::Success) {
             pushPopSpin_.elementPopped();
         }
         return ret;
@@ -1113,18 +1184,34 @@ public:
      * Default is a busy-wait.
      *
      * @param moveElem  Functor that gets called with an rvalue of the element to be poped. The user can decide what to do.
-     * @return          True if successful, false if the queue has been aborted
+     * @return          QueueResult (self-describing). For optimistic approaches  QueueResult::SpuriousFailure is not expected.
      */
     template <typename MoveElemFunctor>
-    bool pop(MoveElemFunctor&& moveElem) noexcept(
+    QueueResult pop(MoveElemFunctor&& moveElem) noexcept(
         noexcept(std::forward<MoveElemFunctor>(moveElem)(std::move(std::declval<T>()))) && noexcept(pushPopSpin_.spinOnPop()(false))) {
         return popWithSpinFunctor(std::forward<MoveElemFunctor>(moveElem), pushPopSpin_.spinOnPop());
     }
 
     /* Calls `popWithSpinFunctor` with the default spin functor specified through template argument of the LowLatencyQueue.
      * Default is a busy-wait.
+     * Throws if the queue has been aborted.
      *
-     * @return        Returns the poped value or nothing if the queue has been aborted.
+     * @param moveElem  Functor that gets called with an rvalue of the element to be poped. The user can decide what to do.
+     * @return          QueueResult (self-describing). For optimistic approaches  QueueResult::SpuriousFailure is not expected.
+     */
+    template <typename MoveElemFunctor>
+    QueueResult popOrThrow(MoveElemFunctor&& moveElem) {
+        QueueResult ret = pop(std::forward<MoveElemFunctor>(moveElem));
+        if (ret == QueueResult::Aborted) {
+            throwIfAborted();
+        }
+        return ret;
+    }
+
+    /* Calls `popWithSpinFunctor` with the default spin functor specified through template argument of the LowLatencyQueue.
+     * Default is a busy-wait.
+     *
+     * @return        Returns the poped value or nothing if the queue has been aborted or closed. Spurious failures are not expected for optimistic approach.
      */
     std::optional<T> popAsOpt() noexcept(
         noexcept(std::is_nothrow_move_constructible<T>::value) && noexcept(pushPopSpin_.spinOnPop()(false))) {
@@ -1132,10 +1219,24 @@ public:
         if (popWithSpinFunctor([&ret](T&& v) noexcept(noexcept(ret = std::move(v))) {
                 ret.emplace(std::move(v));  // Will call move contructor on transition from nothing to something
             },
-                               pushPopSpin_.spinOnPop())) {
+                               pushPopSpin_.spinOnPop())
+            == QueueResult::Success) {
             return ret;
         }
         return std::nullopt;
+    }
+
+    /* Calls `popWithSpinFunctor` with the default spin functor specified through template argument of the LowLatencyQueue.
+     * Default is a busy-wait.
+     *
+     * @return        Returns the poped value or nothing if the queue has been aborted or closed. Spurious failures are not expected for optimistic approach.
+     */
+    std::optional<T> popAsOptOrThrow() {
+        std::optional<T> ret = popAsOpt();
+        if (!ret) {
+            throwIfAborted();
+        }
+        return ret;
     }
 
 
@@ -1159,18 +1260,21 @@ public:
      * @param spin         Function that is called everytime the thread has to spin and wait for an state change of an entry.
      * @param elemOrArgs   Forwards all arguments to the constructor of the element type T.
      *                     (May perform a copy or move construction or just emplaces a value).
-     * @return Boolean whether the element has been sucessfully pushed or false the queue has been aborted
+     * @return             QueueResult (self-describing).
      */
     template <typename SpinFunctor, typename... ElemOrArgs>
-    bool tryPushWithSpinFunctor(SpinFunctor&& spin, ElemOrArgs&&... elemOrArgs) noexcept(
+    QueueResult tryPushWithSpinFunctor(SpinFunctor&& spin, ElemOrArgs&&... elemOrArgs) noexcept(
         noexcept(T(std::forward<ElemOrArgs>(elemOrArgs)...)) && noexcept(spin(false))) {
+        if (close_.load(std::memory_order_relaxed)) {
+            return QueueResult::Closed;
+        }
         auto indt = nextHeadPes();
         if (indt) {
             pushIndex(indt, std::forward<SpinFunctor>(spin), std::forward<ElemOrArgs>(elemOrArgs)...);
             pushPopSpin_.elementPushed();
-            return true;
+            return QueueResult::Success;
         }
-        return false;
+        return QueueResult::SpuriousFailure;
     }
 
     /* Calls `tryPushWithSpinFunctor` with the default spin functor specified through template argument of the LowLatencyQueue.
@@ -1178,10 +1282,10 @@ public:
      *
      * @param elemOrArgs   Forwards all arguments to the constructor of the element type T.
      *                     (May perform a copy or move construction or just emplaces a value).
-     * @return Boolean whether the element has been sucessfully pushed.
+     * @return             QueueResult (self-describing).
      */
     template <typename... ElemOrArgs>
-    bool tryPush(ElemOrArgs&&... elemOrArgs) noexcept(noexcept(tryPushWithSpinFunctor(pushPopSpin_.spinOnPush(), std::forward<ElemOrArgs>(elemOrArgs)...))) {
+    QueueResult tryPush(ElemOrArgs&&... elemOrArgs) noexcept(noexcept(tryPushWithSpinFunctor(pushPopSpin_.spinOnPush(), std::forward<ElemOrArgs>(elemOrArgs)...))) {
         return tryPushWithSpinFunctor(pushPopSpin_.spinOnPush(), std::forward<ElemOrArgs>(elemOrArgs)...);
     }
 
@@ -1205,30 +1309,30 @@ public:
      *
      * @param moveElem  Functor that gets called with an rvalue of the element to be poped. The user can decide what to do.
      * @param spin      Function that is called everytime the thread has to spin and wait for an state change of an entry.
-     * @return          Returns true if deque has been successful.
+     * @return          QueueResult (self-describing).
      */
     template <typename MoveElemFunctor, typename SpinFunctor>
-    bool tryPopWithSpinFunctor(MoveElemFunctor&& moveElem, SpinFunctor&& spin) noexcept(
+    QueueResult tryPopWithSpinFunctor(MoveElemFunctor&& moveElem, SpinFunctor&& spin) noexcept(
         noexcept(std::forward<MoveElemFunctor>(moveElem)(std::move(std::declval<T>()))) && noexcept(spin(false))) {
         auto indt = nextTailPes();
         if (indt) {
-            bool ret = popIndex(indt, std::forward<MoveElemFunctor>(moveElem), std::forward<SpinFunctor>(spin));
-            if (ret) {
+            QueueResult ret = popIndex(indt, std::forward<MoveElemFunctor>(moveElem), std::forward<SpinFunctor>(spin));
+            if (ret == QueueResult::Success) {
                 pushPopSpin_.elementPopped();
             }
             return ret;
         }
-        return false;
+        return QueueResult::SpuriousFailure;
     }
 
     /* Calls `tryPopWithSpinFunctor` with the default spin functor specified through template argument of the LowLatencyQueue.
      * Default is a busy-wait.
      *
      * @param moveElem  Functor that gets called with an rvalue of the element to be poped. The user can decide what to do.
-     * @return          Returns true if pop has been successful.
+     * @return          QueueResult (self-describing).
      */
     template <typename MoveElemFunctor>
-    bool tryPop(MoveElemFunctor&& moveElem) noexcept(
+    QueueResult tryPop(MoveElemFunctor&& moveElem) noexcept(
         noexcept(std::forward<MoveElemFunctor>(moveElem)(std::move(std::declval<T>()))) && noexcept(pushPopSpin_.spinOnPop()(false))) {
         return tryPopWithSpinFunctor(std::forward<MoveElemFunctor>(moveElem), pushPopSpin_.spinOnPop());
     }
@@ -1248,6 +1352,20 @@ public:
             return ret;
         }
         return std::nullopt;
+    }
+
+    /* Calls `tryPopWithSpinFunctor` with the default spin functor specified through template argument of the LowLatencyQueue.
+     * Default is a busy-wait.
+     * Throws if the queue has been aborted.
+     *
+     * @return Returns an optional that either contains a value when the pop operation was successful.
+     */
+    std::optional<T> tryPopAsOptOrThrow() {
+        std::optional<T> ret = tryPopAsOpt();
+        if (!ret) {
+            throwIfAborted();
+        }
+        return ret;
     }
 };
 
